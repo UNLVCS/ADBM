@@ -2,3 +2,4 @@ data/
 *.pyc
 ignore_me
 *.ipynb
+**/*.ipynb
