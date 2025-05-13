@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, DistributedSampler, random_split
 from transformers import T5ForConditionalGeneration, T5TokenizerFast, BitsAndBytesConfig, AutoConfig
 from transformers.optimization import Adafactor, get_scheduler
 from transformers.models.t5.modeling_t5 import T5Block
-from dataset_utils import T5Dataset, DataCollatorForT5
+from ADBM.t5_super_finetune.ignore_me.dataset_utils import T5Dataset, DataCollatorForT5
 from tqdm import tqdm
 import deepspeed
 import os
@@ -464,7 +464,7 @@ class CollatorWrapper:
         self.tokenizer = tokenizer
     
     def __call__(self, batch):
-        from dataset_utils import collator
+        from ADBM.t5_super_finetune.ignore_me.dataset_utils import collator
         return collator(batch, self.tokenizer)
 
 if __name__ == '__main__':
@@ -507,7 +507,9 @@ if __name__ == '__main__':
 
     print(f"***********{BOLD}{GREEN}Loading Model: {args.model_name}{RESET}***********")
 
-    model = T5ForConditionalGeneration.from_pretrained(args.model_name)
+    # model = T5ForConditionalGeneration.from_pretrained(args.model_name)
+    model = T5ForConditionalGeneration.from_pretrained("AbrehamT/dasc_adbmo")
+
 
     # Configuring LoRA to target all layers of the transformer. 
     config = LoraConfig(
@@ -526,7 +528,9 @@ if __name__ == '__main__':
 
 
     # Initialize tokenizer
-    tokenizer = T5TokenizerFast.from_pretrained(args.model_name)
+    # tokenizer = T5TokenizerFast.from_pretrained(args.model_name)
+    tokenizer = T5TokenizerFast.from_pretrained("AbrehamT/dasc_adbmo")
+
 
     pubmed_qa_data, synthetic_data = load_data()
 
