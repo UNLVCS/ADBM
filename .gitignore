@@ -3,3 +3,4 @@ data/
 ignore_me
 *.ipynb
 **/*.ipynb
+.env
