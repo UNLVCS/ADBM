@@ -4,3 +4,5 @@ ignore_me
 *.ipynb
 **/*.ipynb
 .env
+llm_params*.json
+data_labeling
