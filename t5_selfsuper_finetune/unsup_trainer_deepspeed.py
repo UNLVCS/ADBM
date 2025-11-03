@@ -1,4 +1,8 @@
 # A distributed training pipeline that uses deepspeed
+import os
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -24,7 +28,7 @@ from transformers.models.t5.modeling_t5 import T5Block
 from dataset_utils import T5Dataset, collator
 from tqdm import tqdm
 import deepspeed
-import os
+# import os
 import re
 import json
 import argparse
@@ -50,8 +54,12 @@ def setup(rank, world_size):
     Initialize the distributed environment.
     """
     # Setting up the addr and port of the coordinating process
+    # import socket, os
+    # with socket.socket() as s:
+    #     s.bind(('', 0))
+    #     os.environ['MASTER_PORT'] = str(s.getsockname()[1])
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12357'
+    os.environ['MASTER_PORT'] = '12399'
 
     os.environ["RANK"]       = str(rank)
     os.environ["LOCAL_RANK"] = str(rank)
@@ -61,7 +69,7 @@ def setup(rank, world_size):
     # nccl is the backend that handles distributed computing accross nvidia cuda gpu's
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
-def get_deepspeed_config(config_path = '/home/tadesa1/research/ADBMO-UNLV/t5_lora_finetuning/ds_config.json'):
+def get_deepspeed_config(config_path = '/home/tadesse/research/ADBM/t5_selfsuper_finetune/ds_config.json'):
     """
     Load DeepSpeed configurations from json file
     """
@@ -151,7 +159,9 @@ def train_t5_with_deepspeed(
     steps_per_epoch = math.ceil(len(train_dataset) / (batch_size * world_size))
     effective_steps_per_epoch = math.ceil(steps_per_epoch / ds_config['gradient_accumulation_steps'])
     total_num_steps = effective_steps_per_epoch * num_epochs
-    ds_config['scheduler']['params']['total_num_steps'] = total_num_steps
+    # ds_config['scheduler']['params']['total_num_steps'] = total_num_steps
+    ds_config['scheduler']['params']['warmup_num_steps'] = 0.1 * total_num_steps
+
 
     # Initialize DeepSpeed
     model, optimizer, _, lr_scheduler = deepspeed.initialize(
@@ -167,10 +177,12 @@ def train_t5_with_deepspeed(
     start_epoch = 0
 
     # Load from checkpoint if specified
-    if resume_from_checkpoint and rank == 0:
-        print(f"{BOLD}Loading DeepSpeed checkpoint from {resume_from_checkpoint}{RESET}")
+    if resume_from_checkpoint:
+        if rank == 0:
+            print(f"{BOLD}Loading DeepSpeed checkpoint from {resume_from_checkpoint}{RESET}")
         # DeepSpeed has its own checkpoint loading mechanism
-        model.load_checkpoint(resume_from_checkpoint)
+        model.load_checkpoint(resume_from_checkpoint, load_optimizer_states = True, load_lr_scheduler_states = True)
+        # model.load_checkpoint(resume_from_checkpoint, load_optimizer_states = True, load_lr_scheduler_state = True)
         # Extract epoch information if available
         try:
             checkpoint_name = os.path.basename(resume_from_checkpoint)
@@ -181,6 +193,7 @@ def train_t5_with_deepspeed(
         except:
             print(f"{RED}Could not determine start epoch from checkpoint name, starting from 0{RESET}")
             start_epoch = 0
+        dist.barrier()
 
     best_val_loss = float('inf')
 
@@ -188,7 +201,7 @@ def train_t5_with_deepspeed(
     metrics_dir = os.path.join(os.path.dirname(save_path), "metrics")
     if rank == 0:
         os.makedirs(metrics_dir, exist_ok=True)
-    
+    dist.barrier()
     # Track metrics for plotting - load previous metrics if resuming
     metrics_file = os.path.join(metrics_dir, "training_metrics.npz")
     if resume_from_checkpoint and os.path.exists(metrics_file) and rank == 0:
@@ -271,20 +284,21 @@ def train_t5_with_deepspeed(
         # Calculate validation perplexity
         val_perplexity = torch.exp(torch.tensor(avg_val))
         # Store metrics and save plot ONLY on rank 0
-        if rank == 0:
+        # if rank == 0:
 
-            # Save checkpoint after every epoch
-            checkpt_dir = os.path.join(save_path, f"checkpoint-epoch{epoch}")
-            model.save_checkpoint(str( checkpt_dir) )
-            print(f"{BOLD}{GREEN}-> Saved checkpoint at epoch: {epoch} to {checkpt_dir}{RESET}")
-            
+
+        # Save checkpoint after every epoch
+        checkpt_dir = os.path.join(save_path, f"checkpoint-epoch{epoch}")
+        model.save_checkpoint(str( checkpt_dir) )
+        print(f"{BOLD}{GREEN}-> Saved checkpoint at epoch: {epoch} to {checkpt_dir}{RESET}")
+        if dist.get_rank() == 0:
             # Update metrics lists
             train_losses.append(avg_train)
             val_losses.append(avg_val)
             train_perplexities.append(train_perplexity.item())
             val_perplexities.append(val_perplexity.item())
             learning_rates.append(lr_scheduler.get_last_lr()[0])
-            
+                
             # Save metrics to disk (atomic operation)
             tmp_metrics_file = os.path.join(metrics_dir, f"tmp_metrics_{epoch}.npz")
             np.savez(
@@ -323,10 +337,10 @@ def train_t5_with_deepspeed(
 
             with deepspeed.zero.GatheredParameters(model.module.parameters(), modifier_rank=0):
                 # only rank 0 actually dumps the files
-                if rank == 0:
-                    model.module.save_pretrained(f"{save_path}_best/")
-                    tokenizer.save_pretrained(f"{save_path}_best/")
-                    print(f"{GREEN}{BOLD} → New best model saved with Val Loss {best_val_loss:.4f}{RESET}")
+                # if rank == 0:
+                model.module.save_pretrained(f"{save_path}_best/")
+                tokenizer.save_pretrained(f"{save_path}_best/")
+                print(f"{GREEN}{BOLD} → New best model saved with Val Loss {best_val_loss:.4f}{RESET}")
         
         # Sync up before the next epoch
         dist.barrier()
@@ -352,7 +366,7 @@ def train_t5_distributed(
     """
     assert torch.cuda.is_available(), f"{RED}{BOLD}No GPU available!{RESET}"
     world_size = min(torch.cuda.device_count(), num_gpus)
-
+    torch.cuda.set_per_process_memory_fraction(1.0)
     ds_config = get_deepspeed_config()
 
     train_size = int(0.8 * len(dataset))
@@ -446,8 +460,9 @@ def load_training_dt(input_file):
             texts.append(section_text)
             annotations.append(section_annotations)
 
-    with open('/home/tadesa1/research/ADBMO-UNLV/t5_training/gene_species_tagged_articles.json', 'r') as f:
+    with open('/home/tadesse/research/gene_species_tagged_articles.json', 'r') as f:
         data = json.load(f)
+        
     # Flatten json structure
     for pmid, sections in data.items():
         for section_type, content in sections.items():
@@ -467,7 +482,7 @@ def load_training_dt(input_file):
             texts.append(section_text)
             annotations.append(section_annotations)
 
-    with open('/home/tadesa1/research/ADBMO-UNLV/data/disease_tagged_articles.json', 'r') as f:
+    with open('/home/tadesse/research/disease_tagged_articles.json', 'r') as f:
         data = json.load(f)
 
     for pmid, sections in data.items():
@@ -502,37 +517,55 @@ if __name__ == '__main__':
 
     # Parsing command line arguments
 
-    parser = argparse.ArgumentParser(description=f'{BOLD}{BLUE}Train Flan-T5 Models with DeepSpeed{RESET}')
-    parser.add_argument('--model_name', type=str, default="google/flan-t5-base",
-        choices=["google/flan-t5-small", "google/flan-t5-base", "google/flan-t5-large", "google/flan-t5-xl", "google/flan-t5-xxl"],
-        help=f'{BOLD}T5 model variant to use{RESET}')
+    # parser = argparse.ArgumentParser(description=f'{BOLD}{BLUE}Train Flan-T5 Models with DeepSpeed{RESET}')
+    # parser.add_argument('--model_name', type=str, default="google/flan-t5-base",
+    #     choices=["google/flan-t5-small", "google/flan-t5-base", "google/flan-t5-large", "google/flan-t5-xl", "google/flan-t5-xxl"],
+    #     help=f'{BOLD}T5 model variant to use{RESET}')
 
-    parser.add_argument('--batch_size', type=int, default=1, 
-        help=f'{BOLD}Batch size per GPU{RESET}')
+    # parser.add_argument('--batch_size', type=int, default=1, 
+    #     help=f'{BOLD}Batch size per GPU{RESET}')
 
-    parser.add_argument('--num_gpus', type=int, default=2, 
-        help=f'{BOLD}Number of GPUs to use{RESET}')
+    # parser.add_argument('--num_gpus', type=int, default=2, 
+    #     help=f'{BOLD}Number of GPUs to use{RESET}')
 
-    parser.add_argument('--num_epochs', type=int, default=20, 
-        help=f'{BOLD}Number of training epochs{RESET}')
+    # parser.add_argument('--num_epochs', type=int, default=20, 
+    #     help=f'{BOLD}Number of training epochs{RESET}')
 
-    parser.add_argument('--input_file', type=str, 
-        default='/home/tadesa1/research/ADBMO-UNLV/t5_training/converted_from_biocjson.json',
-        help=f'{BOLD}Input text file for training{RESET}')
+    # parser.add_argument('--input_file', type=str, 
+    #     default='/home/tadesa1/research/ADBMO-UNLV/t5_training/converted_from_biocjson.json',
+    #     help=f'{BOLD}Input text file for training{RESET}')
 
-    parser.add_argument('--save_path', type=str, default='/home/tadesa1/research/ADBMO-UNLV/t5_lora_finetuning/t5_finetuned',
-        help=f'{BOLD}Path to save model checkpoints{RESET}')
+    # parser.add_argument('--save_path', type=str, default='/home/tadesa1/research/ADBMO-UNLV/t5_lora_finetuning/t5_finetuned',
+    #     help=f'{BOLD}Path to save model checkpoints{RESET}')
 
-    parser.add_argument('--resume_from_checkpoint', type=str, default=False,
-        help=f'{BOLD}Path to checkpoint to resume training from{RESET}')
+    # parser.add_argument('--resume_from_checkpoint', type=str, default=False,
+    #     help=f'{BOLD}Path to checkpoint to resume training from{RESET}')
 
-    parser.add_argument('--resume_optimizer', action='store_true',
-        help=f'{BOLD}Whether to also load optimizer state from checkpoint{RESET}')
+    # parser.add_argument('--resume_optimizer', action='store_true',
+    #     help=f'{BOLD}Whether to also load optimizer state from checkpoint{RESET}')
 
-    parser.add_argument('--resume_scheduler', action='store_true',
-        help=f'{BOLD}Whether to also load scheduler state from checkpoint{RESET}')
+    # parser.add_argument('--resume_scheduler', action='store_true',
+    #     help=f'{BOLD}Whether to also load scheduler state from checkpoint{RESET}')
     
-    args = parser.parse_args()
+    # args = parser.parse_args()
+
+    # Direct variable assignments (replacing args references)
+    # model_name = "google/flan-t5-small"
+    model_name = "google/flan-t5-xl"
+    batch_size = 6
+    num_gpus = 2
+    num_epochs = 30
+    input_file = '/home/tadesse/research/converted_from_biocjson.json'
+    save_path = '/home/tadesse/research/110325/run1'
+    # resume_from_checkpoint = True
+    # resume_from_checkpoint = '/home/tadesse/research/110125/run2/checkpoint-epoch10'
+    # resume_optimizer = True
+    # resume_scheduler = True
+
+    resume_from_checkpoint = False
+    # resume_from_checkpoint = '/home/tadesse/research/110125/run1/checkpoint-epoch9'
+    resume_optimizer = False
+    resume_scheduler = False
 
     # Suppress TensorFlow logging
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -544,11 +577,11 @@ if __name__ == '__main__':
     os.environ['NCCL_DEBUG'] = 'WARN'
 
 
-    print(f"***********{BOLD}{GREEN}Loading Model: {args.model_name}{RESET}***********")
+    # print(f"***********{BOLD}{GREEN}Loading Model: {model_name}{RESET}***********")
     print(f"{BOLD}Loading in bfloat16 precision{RESET}")
     model = T5ForConditionalGeneration.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.bfloat16,
+        model_name,
+        dtype=torch.bfloat16,
         token=os.getenv('HF_ACCESS_TOKEN')
     )
     # with deepspeed.zero.Init(
@@ -580,9 +613,9 @@ if __name__ == '__main__':
 
 
     # Initialize tokenizer
-    tokenizer = T5TokenizerFast.from_pretrained(args.model_name)
+    tokenizer = T5TokenizerFast.from_pretrained(model_name)
 
-    texts, annotations = load_training_dt(args.input_file)
+    texts, annotations = load_training_dt(input_file)
 
     dataset = T5Dataset(
         texts=texts,
@@ -598,11 +631,11 @@ if __name__ == '__main__':
         tokenizer = tokenizer,
         dataset=dataset,
         collate_fn=my_collator,
-        batch_size=args.batch_size,
-        num_gpus=args.num_gpus,
-        num_epochs=args.num_epochs,
-        save_path=args.save_path,
-        resume_from_checkpoint=args.resume_from_checkpoint,
-        resume_optimizer=args.resume_optimizer,
-        resume_scheduler=args.resume_scheduler
+        batch_size=batch_size,
+        num_gpus=num_gpus,
+        num_epochs=num_epochs,
+        save_path=save_path,
+        resume_from_checkpoint=resume_from_checkpoint,
+        resume_optimizer=resume_optimizer,
+        resume_scheduler=resume_scheduler
     )
