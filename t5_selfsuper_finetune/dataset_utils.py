@@ -54,7 +54,61 @@ class T5Dataset(Dataset):
         corrupted_target = " ".join(target_tokens)
         return corrupted_input, corrupted_target
 
-    def generate_span_mask(self, seq_len, annotation_token_spans=None):
+    def corrupt_ids(self, ids, annotation_token_spans):
+        PAD = self.tokenizer.pad_token_id
+        EOS = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else PAD
+        sequence = ids[:self.max_length]
+
+        # Build the mask (True = will be corrupted)
+        mask = self.generate_span_mask(len(sequence), annotation_token_spans)
+
+        # Skip from masking PAD/EOS
+        for i,t in enumerate(sequence):
+            if t in (PAD,EOS): mask[i] = False
+
+        input_ids, target_ids = [], []
+        sentinel = 0
+        i = 0
+
+        while i < len(sequence):
+            if mask[i]:
+                sentinel_id = self.tokenizer.convert_tokens_to_ids(f"<extra_id_{sentinel}>")
+                input_ids.append(sentinel_id)
+                target_ids.append(sentinel_id)
+
+                # Coppying the whole corrupted ids to target
+                j = i
+                while j < len(sequence) and mask[j]:
+                    target_ids.append(sequence[j])
+                    j += 1
+                i = j
+            else:
+                input_ids.append(sequence[i])
+                i += 1
+        
+        input_ids = input_ids[:self.max_length]
+        target_ids = target_ids[:self.max_length]
+
+        in_ids = input_ids
+        tgt_ids = target_ids
+        seq = sequence
+        L = len(seq)
+        if len(tgt_ids) == 0:
+            # pick a non-special position near the end
+            cand = [p for p,t in enumerate(seq) if t not in (PAD, EOS)]
+            if cand:
+                p = cand[-1]
+                sid = self.tokenizer.convert_tokens_to_ids("<extra_id_0>")
+                in_ids = seq[:p] + [sid] + seq[p+1: L]
+                tgt_ids = [sid, seq[p]]
+                in_ids  = in_ids[:self.max_length]
+                tgt_ids = tgt_ids[:128]
+
+        return in_ids, tgt_ids
+
+        # return input_ids, target_ids
+
+    def generate_span_mask(self, seq_len, annotation_token_spans=None, specials = None):
         # create boolean mask over tokens
         num_to_mask = max(1, int(self.corruption_rate * seq_len))
         mask = np.zeros(seq_len, dtype=bool)
@@ -66,7 +120,10 @@ class T5Dataset(Dataset):
                 mask[ts:te] = True
             num_masked = mask.sum()
 
+        
         # then mask random spans until target corruption rate
+        # print("NUMS MASKED IS", num_masked)
+        # print("NUMS TO MASK IS", num_to_mask)
         while num_masked < num_to_mask:
             span_start = np.random.randint(0, seq_len)
             span_length = max(1, np.random.poisson(self.mean_span_length))
@@ -75,11 +132,21 @@ class T5Dataset(Dataset):
                 continue
             mask[span_start:span_end] = True
             num_masked += (span_end - span_start)
+        
+        if mask.sum() == 0: 
+            cand = [i for i in range(seq_len) if i not in (specials or [])]
+            if cand:
+                mask[np.random.choice(cand)] = True
+
         return mask
 
     def __getitem__(self, idx):
+        # print("HELLO")
         text = self.texts[idx]
         ann_char_spans = self.annotations[idx]
+        # print(len(text))
+        if not text.strip():
+            return self.__getitem__((idx + 1) % len(self.texts))
         # first, tokenize with offsets to align char spans to token indices
         encoding = self.tokenizer(
             text,
@@ -88,7 +155,8 @@ class T5Dataset(Dataset):
             max_length=self.max_length
         )
         offsets = encoding.pop("offset_mapping")
-        tokens = self.tokenizer.convert_ids_to_tokens(encoding["input_ids"])
+        ids = encoding["input_ids"]
+        # tokens = self.tokenizer.convert_ids_to_tokens(encoding["input_ids"])
 
         # ─── DEBUG START ──────────────────────────────────────────────────────────
         # print each token with its character span
@@ -109,22 +177,31 @@ class T5Dataset(Dataset):
                     annotation_token_spans.append((min(token_idxs), max(token_idxs) + 1))
 
         # perform corruption on token strings
-        corrupted_input, corrupted_target = self.corrupt_text(tokens, annotation_token_spans)
+        corrupted_input, corrupted_target = self.corrupt_ids(ids, annotation_token_spans)
+        # corrupted_input, corrupted_target = self.corrupt_text(tokens, annotation_token_spans)
         # finally, tokenize corrupted sequences for model
-        input_ids = self.tokenizer.encode(
-            corrupted_input,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
-        ).squeeze(0)
-        labels = self.tokenizer.encode(
-            corrupted_target,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
-        ).squeeze(0)
+        # print(input_ids)
+        # print(labels)
+        # input_ids = self.tokenizer.encode(
+        #     corrupted_input,
+        #     truncation=True,
+        #     max_length=self.max_length,
+        #     return_tensors="pt"
+        # ).squeeze(0)
+        # labels = self.tokenizer.encode(
+        #     corrupted_target,
+        #     truncation=True,
+        #     max_length=self.max_length,
+        #     return_tensors="pt"
+        # ).squeeze(0)
 
-        return {"input_ids": input_ids, "labels": labels}
+        # return {"input_ids": input_ids, "decoder_input_ids": labels}
+        # return {"input_ids": input_ids, "labels": labels}
+        return {
+            "input_ids": torch.tensor(corrupted_input, dtype= torch.long),
+            "labels": torch.tensor(corrupted_target, dtype= torch.long),
+            "attention_mask": torch.ones(len(corrupted_input), dtype=torch.long)
+        }
 
     def __len__(self):
         return len(self.texts)
