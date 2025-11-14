@@ -6,3 +6,4 @@ ignore_me
 .env
 llm_params*.json
 data_labeling
+.vscode
